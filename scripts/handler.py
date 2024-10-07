@@ -5,7 +5,7 @@ import mimetypes
 import logging
 import shutil
 import json
-import urllib.parse 
+import urllib.parse  
 
 UPLOAD_DIR = "uploads"
 SHOPPING_LIST_FILE = 'shopping_list.json'
