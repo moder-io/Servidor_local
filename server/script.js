@@ -273,10 +273,3 @@ function deleteEvent(date, title) {
         console.error('Error al eliminar el evento:', error);
     });
 }
-
-
-function cambiarPuerto() {
-    const currentURL = window.location.href;
-    const newURL = currentURL.replace(':8080', ':80');
-    window.location.href = newURL;
-}
