@@ -7,6 +7,8 @@ import shutil
 import json
 import urllib.parse  
 
+
+
 UPLOAD_DIR = "uploads"
 SHOPPING_LIST_FILE = 'shopping_list.json'
 CALENDAR_FILE = 'calendar.json'
@@ -20,6 +22,8 @@ ALLOWED_EXTENSIONS = {
 }
 MAX_FILE_SIZE = 1 * 1024 * 1024 * 1024  # 1 GB
 LOG_FILE = 'server.log'
+
+
 
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO, 
                     format='%(asctime)s - %(levelname)s - %(message)s')
