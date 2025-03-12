@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Servidor</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body> 
+<div class="container">
+    <h1>Servidor</h1>
+
+    <div class="upload-section">
+        <h2>Subir Archivos</h2>
+        <input type="file" id="fileInput" multiple>
+        <button onclick="uploadFiles()">Subir</button>
+    </div> 
+
+    <div class="download-section">
+        <ul id="fileList"></ul>
+    </div>
+
+    <div class="space"></div>
+
+    <div class="shopping-list-section">
+        <h2>Lista de Compras</h2>
+        <input type="text" id="itemInput" placeholder="Nuevo ítem">
+        <button onclick="addItem()">Agregar</button>
+        <ul id="shoppingList"></ul>
+    </div>
+
+    <div class="space"></div>
+
+    <div class="calendar-section">
+        <h2>Calendario</h2>
+        <div class="calendar-navigation">
+            <button onclick="prevMonth()">Anterior</button>
+            <span id="monthYear"></span>
+            <button onclick="nextMonth()">Siguiente</button>
+        </div>
+        <div id="calendar"></div>
+        <div id="eventForm">
+            <h3>Agregar Evento</h3>
+            <input type="date" id="eventDate">
+            <input type="text" id="eventTitle" placeholder="Título del evento">
+            <button onclick="addEvent()">Agregar Evento</button>
+        </div>
+    </div>
+</div>
+<script src="script.js"></script>
+</body>
+</html>
