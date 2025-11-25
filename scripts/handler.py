@@ -1,5 +1,6 @@
 from http.server import SimpleHTTPRequestHandler, HTTPServer
-import cgi
+from email.parser import BytesParser
+from email.policy import default
 import os
 import mimetypes
 import logging
@@ -111,7 +112,7 @@ class CustomHTTPRequestHandler(SimpleHTTPRequestHandler):
             self.handle_add_event_post()
             return
 
-        content_type = self.headers.get('Content-Type')
+        content_type = self.headers.get('Content-Type', '')
         content_length = int(self.headers.get('Content-Length', 0))
 
         if content_length > MAX_FILE_SIZE:
@@ -121,67 +122,85 @@ class CustomHTTPRequestHandler(SimpleHTTPRequestHandler):
             self.wfile.write('El archivo es demasiado grande.'.encode('utf-8'))
             return
 
-        if content_type and content_type.startswith('multipart/form-data'):
-            form = cgi.FieldStorage(
-                fp=self.rfile,
-                headers=self.headers,
-                environ={'REQUEST_METHOD': 'POST'}
-            )
+        # Leer el cuerpo entero del POST
+        body = self.rfile.read(content_length)
+
+        # Subida de archivo con formulario <form enctype="multipart/form-data">
+        if content_type.startswith('multipart/form-data'):
+            # Construimos un "mensaje" MIME para que email.parser lo entienda
+            raw_message = (
+                f"Content-Type: {content_type}\r\n"
+                f"MIME-Version: 1.0\r\n"
+                f"\r\n"
+            ).encode('utf-8') + body
+
+            msg = BytesParser(policy=default).parsebytes(raw_message)
 
             if not os.path.exists(UPLOAD_DIR):
                 os.makedirs(UPLOAD_DIR)
 
             file_saved = False
-            for field in form.keys():
-                field_item = form[field]
-                if field_item.filename:
-                    # Conserva el nombre original del archivo y lo sanitiza
-                    file_name = sanitize_filename(os.path.basename(field_item.filename))
 
-                    if not is_allowed_file(file_name):
-                        self.send_response(400)
-                        self.send_header('Content-Type', 'text/plain; charset=utf-8')
-                        self.end_headers()
-                        self.wfile.write('Extensión de archivo no permitida.'.encode('utf-8'))
-                        return
+            # Recorremos las partes del multipart
+            for part in msg.iter_parts():
+                # name="campo" y filename="archivo.ext" vienen en Content-Disposition
+                name = part.get_param('name', header='Content-Disposition')
+                filename = part.get_param('filename', header='Content-Disposition')
 
-                    if not is_allowed_mime_type(file_name):
-                        self.send_response(400)
-                        self.send_header('Content-Type', 'text/plain; charset=utf-8')
-                        self.end_headers()
-                        self.wfile.write('Tipo de archivo no permitido.'.encode('utf-8'))
-                        return
+                # Si no hay filename, es un campo de texto normal: lo ignoramos para la subida
+                if not filename:
+                    continue
 
-                    if not check_disk_space(content_length, UPLOAD_DIR):
-                        self.send_response(507)  # Insufficient Storage
-                        self.send_header('Content-Type', 'text/plain; charset=utf-8')
-                        self.end_headers()
-                        self.wfile.write('No hay suficiente espacio en disco.'.encode('utf-8'))
-                        return
+                # Sanitizar nombre de archivo (manteniendo el original “limpio”)
+                file_name = sanitize_filename(os.path.basename(filename))
 
-                    file_path = os.path.join(UPLOAD_DIR, file_name)
+                # Validar extensión y tipo MIME como hacías antes
+                if not is_allowed_file(file_name):
+                    self.send_response(400)
+                    self.send_header('Content-Type', 'text/plain; charset=utf-8')
+                    self.end_headers()
+                    self.wfile.write('Extensión de archivo no permitida.'.encode('utf-8'))
+                    return
 
-                    try:
-                        with open(file_path, 'wb') as output_file:
-                            output_file.write(field_item.file.read())
-                        os.chmod(file_path, 0o644)
-                        file_saved = True
-                        log_activity(f"Archivo subido: {file_path}")
+                if not is_allowed_mime_type(file_name):
+                    self.send_response(400)
+                    self.send_header('Content-Type', 'text/plain; charset=utf-8')
+                    self.end_headers()
+                    self.wfile.write('Tipo de archivo no permitido.'.encode('utf-8'))
+                    return
 
-                    except IOError as e:
-                        self.send_response(500)
-                        self.send_header('Content-Type', 'text/plain; charset=utf-8')
-                        self.end_headers()
-                        self.wfile.write('Error al guardar el archivo.'.encode('utf-8'))
-                        log_activity(f"Error guardando el archivo {file_path}: {e}", level="ERROR")
-                        return
+                # Comprobar espacio en disco (usamos content_length como aproximación)
+                if not check_disk_space(content_length, UPLOAD_DIR):
+                    self.send_response(507)  # Insufficient Storage
+                    self.send_header('Content-Type', 'text/plain; charset=utf-8')
+                    self.end_headers()
+                    self.wfile.write('No hay suficiente espacio en disco.'.encode('utf-8'))
+                    return
+
+                file_path = os.path.join(UPLOAD_DIR, file_name)
+
+                try:
+                    # Contenido binario del archivo
+                    file_content = part.get_payload(decode=True)
+                    with open(file_path, 'wb') as output_file:
+                        output_file.write(file_content)
+                    os.chmod(file_path, 0o644)
+                    file_saved = True
+                    log_activity(f"Archivo subido: {file_path}")
+
+                except IOError as e:
+                    self.send_response(500)
+                    self.send_header('Content-Type', 'text/plain; charset=utf-8')
+                    self.end_headers()
+                    self.wfile.write('Error al guardar el archivo.'.encode('utf-8'))
+                    log_activity(f"Error guardando el archivo {file_path}: {e}", level="ERROR")
+                    return
 
             if file_saved:
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/plain; charset=utf-8')
                 self.end_headers()
                 self.wfile.write('Archivo subido exitosamente.'.encode('utf-8'))
-
             else:
                 self.send_response(400)
                 self.send_header('Content-Type', 'text/plain; charset=utf-8')
@@ -193,6 +212,7 @@ class CustomHTTPRequestHandler(SimpleHTTPRequestHandler):
             self.send_header('Content-Type', 'text/plain; charset=utf-8')
             self.end_headers()
             self.wfile.write('Error en la subida del archivo.'.encode('utf-8'))
+
 
     def do_DELETE(self):
         if self.path.startswith('/remove_item'):
