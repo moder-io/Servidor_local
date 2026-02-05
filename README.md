@@ -20,13 +20,10 @@ Este proyecto implementa un servidor HTTP simple con funcionalidades de gestión
 1. Asegúrese de tener Python 3.x instalado.
 2. Clone este repositorio:
    ```
-   git clone <url-del-repositorio>
-   cd <directorio-del-repositorio>
+   git clone https://github.com/moder-io/Servidor_local.git
+   cd Servidor_local
    ```
-3. Ejecute el servidor:
-   ```
-   python server.py
-   ```
+3. Ejecute "run.bat".
 4. Acceda a la interfaz web en `http://<su-ip>:8080`
 
 ## Funcionalidad
