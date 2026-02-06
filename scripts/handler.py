@@ -1,4 +1,4 @@
-from http.server import SimpleHTTPRequestHandler, HTTPServer
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from email.parser import BytesParser
 from email.policy import default
 import os
@@ -6,13 +6,13 @@ import mimetypes
 import logging
 import shutil
 import json
-import urllib.parse  
-
-
+import urllib.parse
+import threading
 
 UPLOAD_DIR = "uploads"
 SHOPPING_LIST_FILE = 'shopping_list.json'
 CALENDAR_FILE = 'calendar.json'
+
 ALLOWED_EXTENSIONS = {
     'txt', 'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx',
     'png', 'jpg', 'jpeg', 'gif', 'bmp', 'tiff', 'svg',
@@ -21,377 +21,283 @@ ALLOWED_EXTENSIONS = {
     'zip', 'rar', '7z', 'tar', 'gz',
     'css', 'js', 'html', 'json'
 }
+
 MAX_FILE_SIZE = 1 * 1024 * 1024 * 1024  # 1 GB
 LOG_FILE = 'server.log'
 
+file_lock = threading.Lock()
+shopping_lock = threading.Lock()
+calendar_lock = threading.Lock()
 
-
-logging.basicConfig(filename=LOG_FILE, level=logging.INFO, 
-                    format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 def is_allowed_file(filename):
-    extension = filename.split('.')[-1].lower()
-    return extension in ALLOWED_EXTENSIONS
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 def is_allowed_mime_type(filename):
     mime_type, _ = mimetypes.guess_type(filename)
-    return mime_type and '/' in mime_type
+    return bool(mime_type)
 
 def sanitize_filename(filename):
-    return "".join(c for c in filename if c.isalnum() or c in (' ', '.', '_')).rstrip()
+    return "".join(c for c in filename if c.isalnum() or c in (' ', '.', '_')).strip()
 
-def log_activity(message, level="INFO"):
-    if level == "INFO":
-        logging.info(message)
-    elif level == "WARNING":
-        logging.warning(message)
-    elif level == "ERROR":
-        logging.error(message)
-
-def check_disk_space(file_size, upload_dir):
-    total, used, free = shutil.disk_usage(upload_dir)
+def check_disk_space(file_size, path):
+    total, used, free = shutil.disk_usage(path)
     return free > file_size
 
+def safe_json_load(path):
+    if not os.path.exists(path):
+        return []
+    with open(path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+def safe_json_write(path, data):
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
 class CustomHTTPRequestHandler(SimpleHTTPRequestHandler):
-    server_version = "ServidorSeguro/1.0"
+    server_version = "ServidorSeguro/1.1"
     sys_version = ""
 
     def log_message(self, format, *args):
-        if hasattr(self, 'headers'):
-            user_agent = self.headers.get('User-Agent', 'Desconocido')
-        else:
-            user_agent = 'Desconocido'
-
         client_ip = self.client_address[0]
-        print(f"Solicitud de {client_ip} con User-Agent: {user_agent}")
-        super().log_message(format, *args)
+        user_agent = self.headers.get('User-Agent', 'Desconocido')
+        logging.info(f"{client_ip} - {user_agent} - {format % args}")
+
+    # ================== GET ==================
 
     def do_GET(self):
         if self.path.startswith('/shopping_list'):
             self.handle_shopping_list_get()
             return
-        elif self.path.startswith('/calendar'):
-            self.handle_calendar_get() 
+
+        if self.path.startswith('/calendar'):
+            self.handle_calendar_get()
             return
 
         path = self.translate_path(self.path)
         if os.path.isfile(path):
-            if not is_allowed_file(os.path.basename(path)):
-                self.send_response(403)
-                self.send_header('Content-Type', 'text/plain; charset=utf-8')
-                self.end_headers()
-                self.wfile.write('Archivo no permitido para descarga.'.encode('utf-8'))
+            filename = sanitize_filename(os.path.basename(path))
+
+            if not is_allowed_file(filename):
+                self.send_error(403, "Archivo no permitido")
                 return
 
-            mime_type, _ = mimetypes.guess_type(path)
-            if mime_type is None:
-                mime_type = 'application/octet-stream'
-
+            mime_type = mimetypes.guess_type(path)[0] or 'application/octet-stream'
             self.send_response(200)
             self.send_header('Content-Type', mime_type)
             self.send_header('Content-Length', str(os.path.getsize(path)))
-            self.send_header('Content-Disposition', f'attachment; filename="{os.path.basename(path)}"')
+            self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
             self.end_headers()
 
-            with open(path, 'rb') as file:
-                self.wfile.write(file.read())
+            with open(path, 'rb') as f:
+                shutil.copyfileobj(f, self.wfile)
             return
 
         super().do_GET()
+
+    # ================== POST ==================
 
     def do_POST(self):
         if self.path == '/add_item':
             self.handle_add_item_post()
             return
-        elif self.path == '/add_event':
+
+        if self.path == '/add_event':
             self.handle_add_event_post()
             return
 
-        content_type = self.headers.get('Content-Type', '')
         content_length = int(self.headers.get('Content-Length', 0))
-
         if content_length > MAX_FILE_SIZE:
-            self.send_response(413)
-            self.send_header('Content-Type', 'text/plain; charset=utf-8')
-            self.end_headers()
-            self.wfile.write('El archivo es demasiado grande.'.encode('utf-8'))
+            self.send_error(413, "Archivo demasiado grande")
             return
 
+        content_type = self.headers.get('Content-Type', '')
         body = self.rfile.read(content_length)
 
-        if content_type.startswith('multipart/form-data'):
-            raw_message = (
-                f"Content-Type: {content_type}\r\n"
-                f"MIME-Version: 1.0\r\n"
-                f"\r\n"
-            ).encode('utf-8') + body
+        if not content_type.startswith('multipart/form-data'):
+            self.send_error(400, "Formato inválido")
+            return
 
-            msg = BytesParser(policy=default).parsebytes(raw_message)
+        raw_message = (
+            f"Content-Type: {content_type}\r\n"
+            f"MIME-Version: 1.0\r\n\r\n"
+        ).encode() + body
 
-            if not os.path.exists(UPLOAD_DIR):
-                os.makedirs(UPLOAD_DIR)
+        msg = BytesParser(policy=default).parsebytes(raw_message)
 
-            file_saved = False
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
+        file_saved = False
 
-            for part in msg.iter_parts():
-                name = part.get_param('name', header='Content-Disposition')
-                filename = part.get_param('filename', header='Content-Disposition')
+        for part in msg.iter_parts():
+            raw_filename = part.get_param('filename', header='Content-Disposition')
+            if not raw_filename:
+                continue
 
-                if not filename:
-                    continue
+            raw_filename = str(raw_filename)
+            filename = sanitize_filename(os.path.basename(raw_filename))
 
-                file_name = sanitize_filename(os.path.basename(filename))
+            if not is_allowed_file(filename) or not is_allowed_mime_type(filename):
+                self.send_error(400, "Archivo no permitido")
+                return
 
-                if not is_allowed_file(file_name):
-                    self.send_response(400)
-                    self.send_header('Content-Type', 'text/plain; charset=utf-8')
-                    self.end_headers()
-                    self.wfile.write('Extensión de archivo no permitida.'.encode('utf-8'))
-                    return
+            if not check_disk_space(content_length, UPLOAD_DIR):
+                self.send_error(507, "Espacio insuficiente")
+                return
 
-                if not is_allowed_mime_type(file_name):
-                    self.send_response(400)
-                    self.send_header('Content-Type', 'text/plain; charset=utf-8')
-                    self.end_headers()
-                    self.wfile.write('Tipo de archivo no permitido.'.encode('utf-8'))
-                    return
+            data = part.get_payload(decode=True)
 
-                if not check_disk_space(content_length, UPLOAD_DIR):
-                    self.send_response(507)  # Insufficient Storage
-                    self.send_header('Content-Type', 'text/plain; charset=utf-8')
-                    self.end_headers()
-                    self.wfile.write('No hay suficiente espacio en disco.'.encode('utf-8'))
-                    return
+            if not isinstance(data, (bytes, bytearray)):
+                continue
 
-                file_path = os.path.join(UPLOAD_DIR, file_name)
+            file_path = os.path.join(UPLOAD_DIR, filename)
 
-                try:
-                    file_content = part.get_payload(decode=True)
-                    with open(file_path, 'wb') as output_file:
-                        output_file.write(file_content)
-                    os.chmod(file_path, 0o644)
-                    file_saved = True
-                    log_activity(f"Archivo subido: {file_path}")
+            with file_lock:
+                with open(file_path, 'wb') as f:
+                    f.write(data)
+                os.chmod(file_path, 0o644)
 
-                except IOError as e:
-                    self.send_response(500)
-                    self.send_header('Content-Type', 'text/plain; charset=utf-8')
-                    self.end_headers()
-                    self.wfile.write('Error al guardar el archivo.'.encode('utf-8'))
-                    log_activity(f"Error guardando el archivo {file_path}: {e}", level="ERROR")
-                    return
 
-            if file_saved:
-                self.send_response(200)
-                self.send_header('Content-Type', 'text/plain; charset=utf-8')
-                self.end_headers()
-                self.wfile.write('Archivo subido exitosamente.'.encode('utf-8'))
-            else:
-                self.send_response(400)
-                self.send_header('Content-Type', 'text/plain; charset=utf-8')
-                self.end_headers()
-                self.wfile.write('Error en la subida del archivo.'.encode('utf-8'))
-
-        else:
-            self.send_response(400)
-            self.send_header('Content-Type', 'text/plain; charset=utf-8')
+        if file_saved:
+            self.send_response(200)
             self.end_headers()
-            self.wfile.write('Error en la subida del archivo.'.encode('utf-8'))
+            self.wfile.write(b'Archivo subido exitosamente')
+        else:
+            self.send_error(400, "Error en la subida")
 
+    # ================== DELETE ==================
 
     def do_DELETE(self):
         if self.path.startswith('/remove_item'):
             self.handle_remove_item_delete()
+            return
 
-        elif self.path.startswith('/delete_file'):
+        if self.path.startswith('/delete_file'):
             self.handle_delete_file()
+            return
 
-        elif self.path == '/delete_event':
+        if self.path == '/delete_event':
             self.handle_delete_event()
+            return
 
-        else:
-            super().do_DELETE()
+        self.send_error(404)
 
+    # ================== API ==================
 
     def handle_shopping_list_get(self):
+        with shopping_lock:
+            data = safe_json_load(SHOPPING_LIST_FILE)
+
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.end_headers()
-
-        if os.path.exists(SHOPPING_LIST_FILE):
-            with open(SHOPPING_LIST_FILE, 'r') as file:
-                shopping_list = json.load(file)
-        else:
-            shopping_list = []
-        self.wfile.write(json.dumps(shopping_list).encode())
+        self.wfile.write(json.dumps(data).encode())
 
     def handle_add_item_post(self):
-        content_length = int(self.headers.get('Content-Length', 0))
-        post_data = self.rfile.read(content_length).decode()
-        item = json.loads(post_data).get('name', '').strip()
+        length = int(self.headers.get('Content-Length', 0))
+        item = json.loads(self.rfile.read(length)).get('name', '').strip()
+
         if not item:
-            self.send_response(400)
-            self.send_header('Content-Type', 'text/plain; charset=utf-8')
-            self.end_headers()
-            self.wfile.write('Nombre del ítem vacío.'.encode('utf-8'))
+            self.send_error(400, "Nombre vacío")
             return
 
-        if os.path.exists(SHOPPING_LIST_FILE):
-            with open(SHOPPING_LIST_FILE, 'r') as file:
-                shopping_list = json.load(file)
-        else:
-            shopping_list = []
-
-        shopping_list.append(item)
-        with open(SHOPPING_LIST_FILE, 'w') as file:
-            json.dump(shopping_list, file)
+        with shopping_lock:
+            data = safe_json_load(SHOPPING_LIST_FILE)
+            data.append(item)
+            safe_json_write(SHOPPING_LIST_FILE, data)
 
         self.send_response(200)
-        self.send_header('Content-Type', 'text/plain; charset=utf-8')
         self.end_headers()
-        self.wfile.write('Ítem agregado exitosamente.'.encode('utf-8'))
+        self.wfile.write(b'Item agregado')
 
     def handle_remove_item_delete(self):
-        item_name = self.path.split('/')[-1]
-        if os.path.exists(SHOPPING_LIST_FILE):
-            with open(SHOPPING_LIST_FILE, 'r') as file:
-                shopping_list = json.load(file)
-        else:
-            shopping_list = []
+        item = sanitize_filename(self.path.split('/')[-1])
 
-        shopping_list = [item for item in shopping_list if item != item_name]
-        with open(SHOPPING_LIST_FILE, 'w') as file:
-            json.dump(shopping_list, file)
+        with shopping_lock:
+            data = [i for i in safe_json_load(SHOPPING_LIST_FILE) if i != item]
+            safe_json_write(SHOPPING_LIST_FILE, data)
 
         self.send_response(200)
-        self.send_header('Content-Type', 'text/plain; charset=utf-8')
         self.end_headers()
-        self.wfile.write('Ítem eliminado exitosamente.'.encode('utf-8'))
+        self.wfile.write(b'Item eliminado')
 
     def handle_calendar_get(self):
-        parsed_url = urllib.parse.urlparse(self.path)
-        query_params = urllib.parse.parse_qs(parsed_url.query)
-        
+        parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
+
         try:
-            month = int(query_params.get('month', [None])[0])
-            year = int(query_params.get('year', [None])[0])
-        except (TypeError, ValueError):
-            self.send_response(400)
-            self.send_header('Content-Type', 'text/plain; charset=utf-8')
-            self.end_headers()
-            self.wfile.write('Mes o año no proporcionado correctamente.'.encode('utf-8'))
+            month = int(params['month'][0])
+            year = int(params['year'][0])
+        except Exception:
+            self.send_error(400, "Parámetros inválidos")
             return
 
-        if month is None or year is None:
-            self.send_response(400)
-            self.send_header('Content-Type', 'text/plain; charset=utf-8')
-            self.end_headers()
-            self.wfile.write('Mes o año no proporcionado.'.encode('utf-8'))
-            return
-
-        if os.path.exists(CALENDAR_FILE):
-            with open(CALENDAR_FILE, 'r') as file:
-                calendar_events = json.load(file)
-        else:
-            calendar_events = []
-
-        filtered_events = [
-            event for event in calendar_events
-            if int(event['date'].split('-')[1]) == month and int(event['date'].split('-')[0]) == year
-        ]
+        with calendar_lock:
+            events = [
+                e for e in safe_json_load(CALENDAR_FILE)
+                if int(e['date'][:4]) == year and int(e['date'][5:7]) == month
+            ]
 
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.end_headers()
-        self.wfile.write(json.dumps(filtered_events).encode())
+        self.wfile.write(json.dumps(events).encode())
 
     def handle_add_event_post(self):
-        content_length = int(self.headers.get('Content-Length', 0))
-        post_data = self.rfile.read(content_length).decode()
-        event_data = json.loads(post_data)
-        date = event_data.get('date', '').strip()
-        title = event_data.get('title', '').strip()
+        length = int(self.headers.get('Content-Length', 0))
+        data = json.loads(self.rfile.read(length))
 
-        if not date or not title:
-            self.send_response(400)
-            self.send_header('Content-Type', 'text/plain; charset=utf-8')
-            self.end_headers()
-            self.wfile.write('Fecha o título del evento vacío.'.encode('utf-8'))
+        if not data.get('date') or not data.get('title'):
+            self.send_error(400, "Datos inválidos")
             return
 
-        if os.path.exists(CALENDAR_FILE):
-            with open(CALENDAR_FILE, 'r') as file:
-                calendar_events = json.load(file)
-        else:
-            calendar_events = []
-
-        calendar_events.append({'date': date, 'title': title})
-        with open(CALENDAR_FILE, 'w') as file:
-            json.dump(calendar_events, file)
+        with calendar_lock:
+            events = safe_json_load(CALENDAR_FILE)
+            events.append(data)
+            safe_json_write(CALENDAR_FILE, events)
 
         self.send_response(200)
-        self.send_header('Content-Type', 'text/plain; charset=utf-8')
         self.end_headers()
-        self.wfile.write('Evento agregado exitosamente.'.encode('utf-8'))
+        self.wfile.write(b'Evento agregado')
 
     def handle_delete_file(self):
-        file_name = self.path.split('/')[-1]
-        file_path = os.path.join(UPLOAD_DIR, file_name)
+        filename = sanitize_filename(self.path.split('/')[-1])
+        file_path = os.path.join(UPLOAD_DIR, filename)
 
-        if os.path.exists(file_path):
-            os.remove(file_path)
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/plain; charset=utf-8')
-            self.end_headers()
-            self.wfile.write('Archivo eliminado exitosamente.'.encode('utf-8'))
-        else:
-            self.send_response(404)
-            self.send_header('Content-Type', 'text/plain; charset=utf-8')
-            self.end_headers()
-            self.wfile.write('Archivo no encontrado.'.encode('utf-8'))
-
-    def handle_delete_event(self):
-        content_length = int(self.headers.get('Content-Length', 0))
-        post_data = self.rfile.read(content_length).decode()
-        event_data = json.loads(post_data)
-        date = event_data.get('date', '').strip()
-        title = event_data.get('title', '').strip()
-
-        if not date or not title:
-            self.send_response(400)
-            self.send_header('Content-Type', 'text/plain; charset=utf-8')
-            self.end_headers()
-            self.wfile.write('Fecha o título del evento vacío.'.encode('utf-8'))
+        if not os.path.isfile(file_path):
+            self.send_error(404, "Archivo no encontrado")
             return
 
-        if os.path.exists(CALENDAR_FILE):
-            with open(CALENDAR_FILE, 'r') as file:
-                calendar_events = json.load(file)
-        else:
-            calendar_events = []
-
-        calendar_events = [event for event in calendar_events if not (event['date'] == date and event['title'] == title)]
-
-        with open(CALENDAR_FILE, 'w') as file:
-            json.dump(calendar_events, file)
+        with file_lock:
+            os.remove(file_path)
 
         self.send_response(200)
-        self.send_header('Content-Type', 'text/plain; charset=utf-8')
         self.end_headers()
-        self.wfile.write('Evento eliminado exitosamente.'.encode('utf-8'))
+        self.wfile.write(b'Archivo eliminado')
 
- 
+    def handle_delete_event(self):
+        length = int(self.headers.get('Content-Length', 0))
+        target = json.loads(self.rfile.read(length))
 
+        with calendar_lock:
+            events = [
+                e for e in safe_json_load(CALENDAR_FILE)
+                if not (e['date'] == target.get('date') and e['title'] == target.get('title'))
+            ]
+            safe_json_write(CALENDAR_FILE, events)
 
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'Evento eliminado')
 
-def run(server_class=HTTPServer, handler_class=CustomHTTPRequestHandler, port=8080):
-    server_address = ('', port)
-    httpd = server_class(server_address, handler_class)
-    print(f'Servidor HTTP corriendo en el puerto {port}...')
-    httpd.serve_forever()
-
-
-
+def run(port=8080):
+    server = ThreadingHTTPServer(('', port), CustomHTTPRequestHandler)
+    print(f"Servidor HTTP corriendo en el puerto {port}")
+    server.serve_forever()
 
 if __name__ == "__main__":
     run()
